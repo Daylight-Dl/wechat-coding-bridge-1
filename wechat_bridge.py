@@ -454,8 +454,59 @@ def has_media_items(msg):
     return False
 
 
-def receive_message(msg):
-    """返回要发给 claude 的文本。纯文本直接返回; 含图片/语音/文件则下载解密并把本地路径标注进文本。硬超时杀树。"""
+def describe_image(image_path, context_token, account):
+    """用 Claude API 描述图片内容, 返回纯文本描述。失败则返回空字符串。"""
+    try:
+        with open(image_path, "rb") as f:
+            img_bytes = f.read()
+        img_b64 = base64.b64encode(img_bytes).decode()
+        ext = os.path.splitext(image_path)[1].lower()
+        mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                     ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
+        mime = mime_map.get(ext, "image/jpeg")
+    except Exception as e:
+        log("读图失败: %s" % e)
+        return ""
+
+    # 构建 Claude Messages API 请求(直接调 API 拿图片描述)
+    url = (account.get("baseUrl") or BASE).rstrip("/") + "/v1/messages"
+    payload = {
+        "model": "claude-sonnet-4-5-20250514",
+        "max_tokens": 1024,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": mime, "data": img_b64}},
+                {"type": "text", "text": "请用中文简洁描述这张图片的内容。不超过200字。"}
+            ]
+        }],
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "AuthorizationType": "ilink_bot_token",
+        "X-WECHAT-UIN": rand_uin(),
+        "Authorization": "Bearer " + account["token"],
+        "Content-Length": str(len(body)),
+    }
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=30) as r:
+            resp = json.loads(r.read().decode("utf-8"))
+        text_blocks = [
+            blk.get("text", "") for blk in resp.get("content", [])
+            if blk.get("type") == "text"
+        ]
+        return "\n".join(text_blocks).strip()
+    except Exception as e:
+        log("图片描述API失败: %s" % str(e)[:120])
+        return ""
+
+
+def receive_message(msg, account):
+    """返回要发给 claude 的文本。纯文本直接返回; 含图片/语音/文件则下载解密。
+    图片会额外调用 Claude API 描述内容, 把描述文本注入给模型。硬超时杀树。"""
     if not has_media_items(msg):
         return extract_text(msg)
     try:
@@ -481,10 +532,19 @@ def receive_message(msg):
         if data.get("text"):
             parts.append(data["text"])
         for a in data.get("attachments") or []:
-            kind = {"image": "图片", "file": "文件"}.get(
-                a.get("kind"), a.get("kind") or "附件")
-            parts.append("[主人通过微信发来一个%s, 已存到本地: %s (用 Read 工具查看内容)]"
-                         % (kind, a.get("path")))
+            kind = a.get("kind", "附件")
+            path = a.get("path", "")
+            if kind == "image" and path and os.path.exists(path):
+                # 用 Claude API 描述图片
+                desc = describe_image(path, LATEST_CTX.get(frm, ""), account)
+                if desc:
+                    parts.append("[主人通过微信发来一张图片, 内容是: %s]" % desc)
+                else:
+                    parts.append("[主人通过微信发来一张图片, 已存到本地: %s (但无法识别内容)]" % path)
+            else:
+                kind_cn = {"image": "图片", "file": "文件", "voice": "语音", "video": "视频"}.get(
+                    kind, kind or "附件")
+                parts.append("[主人通过微信发来一个%s, 已存到本地: %s]" % (kind_cn, path))
         log("收到媒体: %d 个附件" % len(data.get("attachments") or []))
         return "\n".join(parts).strip()
     except Exception as e:
@@ -495,7 +555,7 @@ def receive_message(msg):
 # ============ 消费者: 后台 worker, 串行处理 ============
 
 def process_one(account, msg, frm, use_ctx):
-    text = receive_message(msg)   # 媒体下载解密(带硬超时)
+    text = receive_message(msg, account)   # 媒体下载解密(带硬超时)
     if not text:
         log("空内容, 跳过 claude")
         return
