@@ -36,6 +36,7 @@ SESSION_FILE = os.path.join(PROJ_DIR, "session.json")
 SEND_MEDIA_JS = os.path.join(PROJ_DIR, "send_media.mjs")
 RECV_MEDIA_JS = os.path.join(PROJ_DIR, "recv_media.mjs")
 TMP_DIR = os.path.join(PROJ_DIR, ".tmp")
+MEDIA_RETENTION_HOURS = 2  # 下载的图片/文件保留时长(小时)
 
 # D盘日志目录
 LOG_DIR = r"D:\wechat_bridge_logs"
@@ -596,6 +597,24 @@ def worker():
             WORK_Q.task_done()
 
 
+def clean_old_media():
+    """清理 TMP_DIR 中超过保留时长的文件(图片/下载附件/临时消息json)。"""
+    if not os.path.exists(TMP_DIR):
+        return
+    cutoff = time.time() - MEDIA_RETENTION_HOURS * 3600
+    cleaned = 0
+    try:
+        for fname in os.listdir(TMP_DIR):
+            fpath = os.path.join(TMP_DIR, fname)
+            if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                os.remove(fpath)
+                cleaned += 1
+    except Exception as e:
+        log("清理临时文件失败: %s" % e)
+    if cleaned:
+        log("已清理 %d 个过期临时文件" % cleaned)
+
+
 # ============ 生产者: 主循环, 只收+回执+入队, 永不阻塞 ============
 
 def handle_inbound(account, owner, msg, seen, start_ms):
@@ -656,7 +675,13 @@ def producer(account, owner):
         start_ms = time.time() * 1000 - 8000  # 8s 宽限; 忽略启动前的历史消息
         sync_buf = ""
         seen = set()
+        last_cleanup = time.time()
+        CLEANUP_INTERVAL = 3600  # 每小时清理一次
         while True:
+            # 定期清理过期临时文件
+            if time.time() - last_cleanup > CLEANUP_INTERVAL:
+                clean_old_media()
+                last_cleanup = time.time()
             try:
                 resp = api(account, "ilink/bot/getupdates", {"get_updates_buf": sync_buf, "base_info": {"channel_version": CHANNEL_VERSION}, "timeout": 40})
             except Exception as e:
