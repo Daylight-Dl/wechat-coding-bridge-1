@@ -11,21 +11,37 @@ iLink getupdates(收) -> 队列 -> 后台 worker: claude -p(大脑) -> iLink sen
 
 配置: 同目录 config.json(可选), 字段 claude_exe / work_dir / effort 全部可缺省, 见 config.example.json。
 """
-import json, os, sys, time, datetime, subprocess, secrets, base64, re
-import threading, queue
+import shutil
+import json
+import os
+import sys
+import time
+import datetime
+import subprocess
+import secrets
+import base64
+import re
+import shutil
+import threading
+import queue
 import urllib.request
 
 HOME = os.path.expanduser("~")
 DATA_DIR = os.path.join(HOME, ".cli-bridge")
-CRED_FILE = os.path.join(DATA_DIR, "account.json")
-CONTEXT_CACHE_FILE = os.path.join(DATA_DIR, "context_tokens.json")  # 给 send_media.mjs 复用的上下文token缓存
-PROJ_DIR = os.path.dirname(os.path.abspath(__file__))  # 本脚本所在目录(自动定位, 不写死)
-SESSION_FILE = os.path.join(PROJ_DIR, "session.json")
-SEND_MEDIA_JS = os.path.join(PROJ_DIR, "send_media.mjs")  # Node 发文件/图片助手
-RECV_MEDIA_JS = os.path.join(PROJ_DIR, "recv_media.mjs")  # Node 收图片/文件助手
-TMP_DIR = os.path.join(PROJ_DIR, ".tmp")
-LOG_FILE = os.path.join(PROJ_DIR, "wechat_bridge.log")
+CRED_FILE = os.path.join(DATA_DIR, "account-token.json")
+CONTEXT_CACHE_FILE = os.path.join(DATA_DIR, "context_tokens.json")
 
+PROJ_DIR = os.path.dirname(os.path.abspath(__file__))
+SESSION_FILE = os.path.join(PROJ_DIR, "session.json")
+SEND_MEDIA_JS = os.path.join(PROJ_DIR, "send_media.mjs")
+RECV_MEDIA_JS = os.path.join(PROJ_DIR, "recv_media.mjs")
+TMP_DIR = os.path.join(PROJ_DIR, ".tmp")
+
+# D盘日志目录
+LOG_DIR = r"D:\wechat_bridge_logs"
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
+LOG_FILE = os.path.join(LOG_DIR, "wechat_bridge.log")
 # 发送本地文件/图片的指令: 模型在回复里写 [[SENDFILE:路径]] / [[SENDFILE:路径|显示名]] / [[SENDIMAGE:路径|配文]]
 MEDIA_RE = re.compile(r"\[\[SEND(FILE|IMAGE):([^\]]+)\]\]")
 
@@ -44,7 +60,6 @@ def _load_config():
     return {}
 
 
-import shutil
 _CFG = _load_config()
 
 
@@ -77,7 +92,8 @@ EFFORT = _CFG.get("effort", "high")
 # 大脑适配器: claude(默认/功能最全) | codex | custom(任意"一句话出答案"的 CLI)
 ADAPTER = (_CFG.get("adapter") or "claude").strip().lower()
 CODEX_EXE = _CFG.get("codex_exe") or shutil.which("codex") or "codex"
-CODEX_EXEC_ARGS = _CFG.get("codex_exec_args") or ["--full-auto", "--skip-git-repo-check"]
+CODEX_EXEC_ARGS = _CFG.get("codex_exec_args") or [
+    "--full-auto", "--skip-git-repo-check"]
 _CUSTOM = _CFG.get("custom") or {}
 
 # 子进程硬超时(秒)
@@ -143,7 +159,8 @@ def run_proc(args, cwd, timeout, stdin_text=None):
     eff = _maybe_cmd_wrap(args)
     try:
         p = subprocess.Popen(eff, cwd=cwd,
-                             stdin=(subprocess.PIPE if stdin_text is not None else None),
+                             stdin=(
+                                 subprocess.PIPE if stdin_text is not None else None),
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
     except FileNotFoundError:
@@ -156,7 +173,7 @@ def run_proc(args, cwd, timeout, stdin_text=None):
     except subprocess.TimeoutExpired:
         try:
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
-                          capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=15)
+                           capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=15)
         except Exception:
             pass
         try:
@@ -171,6 +188,8 @@ def run_proc(args, cwd, timeout, stdin_text=None):
 
 
 def load_account():
+    if not os.path.exists(CRED_FILE):
+        return {}
     with open(CRED_FILE, encoding="utf-8") as f:
         return json.load(f)
 
@@ -192,7 +211,8 @@ def api(account, endpoint, body_obj, timeout=40):
         "Authorization": "Bearer " + account["token"],
         "Content-Length": str(len(body)),
     }
-    req = urllib.request.Request(base + endpoint, data=body, headers=headers, method="POST")
+    req = urllib.request.Request(
+        base + endpoint, data=body, headers=headers, method="POST")
     # 每次新建 opener: 直连绕代理 + 多线程安全(生产者长轮询与 worker 发送互不污染)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(req, timeout=timeout) as r:
@@ -241,7 +261,8 @@ def run_brain(text):
 def run_claude(text):
     """Claude Code: claude -p, stream-json 解析, --resume 续接。中文走宽字符参数不乱码, 硬超时杀树。"""
     sess = load_session()
-    sid = sess.get("session_id") if sess.get("adapter", "claude") == "claude" else None
+    sid = sess.get("session_id") if sess.get(
+        "adapter", "claude") == "claude" else None
     args = [CLAUDE_EXE, "-p", text,
             "--output-format", "stream-json", "--verbose",
             "--permission-mode", "bypassPermissions",
@@ -287,9 +308,11 @@ def run_codex(text):
     """Codex CLI(headless): 新会话 `codex exec` / 续接 `codex exec resume --last`。
     最终回复用 `-o <文件>` 取(干净的最后一条消息), 不依赖解析 JSON 事件格式。"""
     sess = load_session()
-    has_session = sess.get("adapter") == "codex" and bool(sess.get("codex_started"))
+    has_session = sess.get("adapter") == "codex" and bool(
+        sess.get("codex_started"))
     os.makedirs(TMP_DIR, exist_ok=True)
-    last_file = os.path.join(TMP_DIR, "codex_last_%s.txt" % secrets.token_hex(4))
+    last_file = os.path.join(TMP_DIR, "codex_last_%s.txt" %
+                             secrets.token_hex(4))
     # 末尾 '-' = 提问从 stdin 读(中文不经命令行, 不乱码)
     tail = list(CODEX_EXEC_ARGS) + ["-C", CWD, "-o", last_file, "-"]
     if has_session:
@@ -299,7 +322,8 @@ def run_codex(text):
         args = [CODEX_EXE, "exec"] + tail
         stdin_text = _persona_prefix(text)  # 新会话注入人设
     log("run codex (resume=%s): %s" % (has_session, text[:40]))
-    status, out, err = run_proc(args, CWD, CLAUDE_TIMEOUT, stdin_text=stdin_text)
+    status, out, err = run_proc(
+        args, CWD, CLAUDE_TIMEOUT, stdin_text=stdin_text)
     if status == "notfound":
         log("codex 未找到: %s" % CODEX_EXE)
         return "(找不到 codex 程序, 检查 config.json 的 codex_exe 或系统 PATH)"
@@ -333,7 +357,8 @@ def run_custom(text):
         return "(未配置 custom.cmd, 请在 config.json 的 custom 里填你的 coding 工具命令)"
     raw_args = _CUSTOM.get("args") or ["{prompt}"]
     prompt = _persona_prefix(text)
-    args = [cmd] + [(a.replace("{prompt}", prompt) if isinstance(a, str) else str(a)) for a in raw_args]
+    args = [cmd] + [(a.replace("{prompt}", prompt)
+                     if isinstance(a, str) else str(a)) for a in raw_args]
     log("run custom (%s): %s" % (cmd, text[:40]))
     status, out, err = run_proc(args, CWD, CLAUDE_TIMEOUT)
     if status == "notfound":
@@ -383,7 +408,8 @@ def persist_context(frm, ctx):
 def send_media(kind, file_path, to_user_id, label=None):
     """调 Node 助手发文件/图片。kind=FILE|IMAGE。返回是否成功。硬超时杀树。"""
     action = "image" if kind == "IMAGE" else "file"
-    args = ["node", SEND_MEDIA_JS, action, file_path, to_user_id or "", (label or "")]
+    args = ["node", SEND_MEDIA_JS, action,
+            file_path, to_user_id or "", (label or "")]
     status, out, err = run_proc(args, PROJ_DIR, SEND_TIMEOUT)
     sout = (out or "").strip()
     ok = '"ok":true' in sout
@@ -437,7 +463,8 @@ def receive_message(msg):
         tmp = os.path.join(TMP_DIR, "inmsg_%s.json" % secrets.token_hex(4))
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(msg, f, ensure_ascii=False)
-        status, out, err = run_proc(["node", RECV_MEDIA_JS, tmp], PROJ_DIR, RECV_TIMEOUT)
+        status, out, err = run_proc(
+            ["node", RECV_MEDIA_JS, tmp], PROJ_DIR, RECV_TIMEOUT)
         try:
             os.remove(tmp)
         except Exception:
@@ -454,7 +481,8 @@ def receive_message(msg):
         if data.get("text"):
             parts.append(data["text"])
         for a in data.get("attachments") or []:
-            kind = {"image": "图片", "file": "文件"}.get(a.get("kind"), a.get("kind") or "附件")
+            kind = {"image": "图片", "file": "文件"}.get(
+                a.get("kind"), a.get("kind") or "附件")
             parts.append("[主人通过微信发来一个%s, 已存到本地: %s (用 Read 工具查看内容)]"
                          % (kind, a.get("path")))
         log("收到媒体: %d 个附件" % len(data.get("attachments") or []))
@@ -483,9 +511,11 @@ def process_one(account, msg, frm, use_ctx):
     for kind, fpath, label in medias:
         try:
             if send_media(kind, fpath, frm, label):
-                log("已发%s: %s" % ("图片" if kind == "IMAGE" else "文件", os.path.basename(fpath)))
+                log("已发%s: %s" % ("图片" if kind ==
+                    "IMAGE" else "文件", os.path.basename(fpath)))
             else:
-                send_text(account, frm, send_ctx, "(发送文件失败: %s, 看下路径或大小是否超限)" % os.path.basename(fpath))
+                send_text(account, frm, send_ctx,
+                          "(发送文件失败: %s, 看下路径或大小是否超限)" % os.path.basename(fpath))
         except Exception as e:
             log("send media err: %s" % str(e)[:140])
 
@@ -555,40 +585,47 @@ def handle_inbound(account, owner, msg, seen, start_ms):
 
 
 def producer(account, owner):
-    log("桥启动(异步)。owner=%s base=%s cwd=%s" % (owner, account["baseUrl"], CWD))
-    start_ms = time.time() * 1000 - 8000   # 8s 宽限; 忽略启动前的历史消息
-    sync_buf = ""
-    seen = set()
-    while True:
-        try:
-            resp = api(account, "ilink/bot/getupdates",
-                       {"get_updates_buf": sync_buf, "base_info": {"channel_version": CHANNEL_VERSION}},
-                       timeout=40)
-        except Exception as e:
-            log("getupdates err: %s" % str(e)[:140])
-            time.sleep(2)
-            continue
-        if resp.get("errcode") == -14 and "session timeout" in (resp.get("errmsg", "") or "").lower():
-            log("sync session timeout, 清空游标")
-            sync_buf = ""
-            continue
-        ret, errcode = resp.get("ret"), resp.get("errcode")
-        if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
-            log("getupdates bad: ret=%s errcode=%s msg=%s" % (ret, errcode, resp.get("errmsg")))
-            time.sleep(2)
-            continue
-        if resp.get("get_updates_buf"):
-            sync_buf = resp["get_updates_buf"]
-        for m in (resp.get("msgs") or []):
+        # 检查是否有 baseUrl
+        if account is None or "baseUrl" not in account:
+            print(f"❌ 错误：account 为空或缺失 'baseUrl' 字段。当前数据为: {account}")
+            return
+
+        # 这就是原来那行日志代码
+        log("桥启动(异步), owner=%s base=%s cwd=%s" % (owner, account["baseUrl"], CWD))
+
+        start_ms = time.time() * 1000 - 8000  # 8s 宽限; 忽略启动前的历史消息
+        sync_buf = ""
+        seen = set()
+        while True:
             try:
-                handle_inbound(account, owner, m, seen, start_ms)
+                resp = api(account, "ilink/bot/getupdates", {"get_updates_buf": sync_buf, "base_info": {"channel_version": CHANNEL_VERSION}, "timeout": 40})
             except Exception as e:
-                log("producer handle err: %s" % str(e)[:140])
-        time.sleep(0.3)
+                log("getupdates err: %s" % str(e)[:140])
+                time.sleep(2)
+                continue
+
+            if resp.get("errcode") == -14 and "session timeout" in (resp.get("errmsg", "") or "").lower():
+                log("sync session timeout, 清空游标")
+                sync_buf = ""
+                continue
+
+            ret, errcode = resp.get("ret"), resp.get("errcode")
+            if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
+                log("getupdates bad: ret=%s errcode=%s msg=%s" % (ret, errcode, resp.get("errmsg")))
+                time.sleep(2)
+                continue
+
+            if resp.get("get_updates_buf"):
+                sync_buf = resp["get_updates_buf"]
+                for m in (resp.get("msgs") or []):
+                    handle_inbound(account, owner, m, seen, start_ms)
 
 
 def main():
     account = load_account()
+    if account is None:
+        print("❌ 错误：account 为 None，微信登录或初始化失败！请检查是否扫码登录成功。")
+        return
     owner = account.get("userId")
     t = threading.Thread(target=worker, daemon=True)
     t.start()
