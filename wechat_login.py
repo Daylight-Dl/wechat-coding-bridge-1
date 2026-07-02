@@ -73,9 +73,6 @@ def main():
             # 不打印 token；只打印非敏感标识
             print("LOGIN_CONFIRMED account=%s user=%s" %
                   (account["accountId"], account["userId"]), flush=True)
-            # 把完整的登录信息保存到 session.json
-            with open("session.json", "w", encoding="utf-8") as f:
-                json.dump(account, f, ensure_ascii=False, indent=2)
             return 0
         elif s == "expired":
             print("QR_EXPIRED", flush=True)

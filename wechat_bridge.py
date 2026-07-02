@@ -28,7 +28,7 @@ import urllib.request
 
 HOME = os.path.expanduser("~")
 DATA_DIR = os.path.join(HOME, ".cli-bridge")
-CRED_FILE = os.path.join(DATA_DIR, "account-token.json")
+CRED_FILE = os.path.join(DATA_DIR, "account.json")
 CONTEXT_CACHE_FILE = os.path.join(DATA_DIR, "context_tokens.json")
 
 PROJ_DIR = os.path.dirname(os.path.abspath(__file__))
